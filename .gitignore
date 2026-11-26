@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset (troppo grande per git, va scaricato a parte)
+DATA/
+
+# Pesi dei modelli
+checkpoints/
