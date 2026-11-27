@@ -64,8 +64,8 @@ class ArcsinhScaler:
 
     def transform_target(self, target: ArrayOrTensor) -> ArrayOrTensor:
         """
-        Normalizza i target (NDVI, GNDVI, EVI).
-        Accetta NumPy array o PyTorch Tensor di shape (..., 3).
+        Normalizza i target (NDVI, GNDVI, EVI) sull'ultima dimensione (..., 3).
+        Accetta NumPy array o PyTorch Tensor.
         """
         if isinstance(target, torch.Tensor):
             mean = torch.as_tensor(self.target_mean, dtype=target.dtype, device=target.device)
@@ -76,28 +76,32 @@ class ArcsinhScaler:
         z = (target - self.target_mean) / self.target_std
         return np.arcsinh(z)
 
-    def inverse_transform_target(self, y: ArrayOrTensor) -> ArrayOrTensor:
+    def inverse_transform_target(
+        self,
+        y: ArrayOrTensor,
+        target_axis: int | None = None,
+    ) -> ArrayOrTensor:
         """
         Inverte la normalizzazione sui target o sulle predizioni dei quantili.
-        Accetta:
-          - shape (..., 3) per target singoli (es. (Batch, 3_step, 3_indici))
-          - shape (..., 3, Q) per quantili (es. (Batch, 3_step, 3_indici, 3_quantili))
+        Convenzione shape del progetto:
+          - Target senza quantili: (3_step, 3_indici) o (Batch, 3_step, 3_indici) -> target_axis = -1
+          - Predizioni coi 3 quantili: (Batch, 3_step, 3_indici, 3_quantili)      -> target_axis = -2
+        Se target_axis è None, usa automaticamente -2 per tensori 4D e -1 altrimenti.
         """
+        if target_axis is None:
+            target_axis = -2 if y.ndim == 4 else -1
+
+        shape = [1] * y.ndim
+        shape[target_axis] = 3
+
         if isinstance(y, torch.Tensor):
-            mean = torch.as_tensor(self.target_mean, dtype=y.dtype, device=y.device)
-            std = torch.as_tensor(self.target_std, dtype=y.dtype, device=y.device)
-            if y.ndim >= 2 and y.shape[-1] != 3 and y.shape[-2] == 3:
-                # Caso (..., 3_indici, 3_quantili) dove i 3 indici sono sulla penultima dimensione
-                mean = mean.unsqueeze(-1)
-                std = std.unsqueeze(-1)
+            mean = torch.as_tensor(self.target_mean, dtype=y.dtype, device=y.device).view(*shape)
+            std = torch.as_tensor(self.target_std, dtype=y.dtype, device=y.device).view(*shape)
             return torch.sinh(y) * std + mean
 
         y = np.asarray(y, dtype=np.float32)
-        mean = self.target_mean
-        std = self.target_std
-        if y.ndim >= 2 and y.shape[-1] != 3 and y.shape[-2] == 3:
-            mean = mean[:, None]
-            std = std[:, None]
+        mean = self.target_mean.reshape(*shape)
+        std = self.target_std.reshape(*shape)
         return np.sinh(y) * std + mean
 
 
