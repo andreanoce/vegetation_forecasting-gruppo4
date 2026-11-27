@@ -132,8 +132,7 @@ Thumbs.db
 # ==========================================
 # Dataset e Traccia Progetto (NON caricare su GitHub)
 # ==========================================
-DATA/
-data/
+/DATA/
 *.npz
 *.npy
 *.parquet
