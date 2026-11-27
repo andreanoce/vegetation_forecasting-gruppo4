@@ -22,8 +22,11 @@ SplitName = Literal["train", "train_val", "val_id", "ood_s", "ood_t", "custom"]
 class GreenEarthNetDataset(Dataset):
     """
     Dataset PyTorch per GreenEarthNet (previsione multi-output di NDVI, GNDVI, EVI).
-    Carica i file .npz, applica lo split train/train_val senza data leakage
-    e preprocessa ogni finestra su richiesta.
+    Per 'train' e 'train_val' effettua uno split ibrido Spazio-Temporale senza data leakage:
+      - Validazione Spaziale: 1 area ogni 10 (8 aree su 84) è interamente riservata a 'train_val'
+        per misurare la generalizzazione su regioni mai viste (come in ood-s).
+      - Validazione Temporale: sulle restanti 76 aree, l'ultimo 12% delle finestre (fine 2019/2020)
+        dopo un buffer di 6 finestre (zero minicubi condivisi) è riservato a 'train_val'.
     """
 
     def __init__(
@@ -31,7 +34,8 @@ class GreenEarthNetDataset(Dataset):
         split: SplitName = "train",
         data_dir: Union[str, Path, None] = None,
         scaler: ArcsinhScaler | None = None,
-        val_ratio: float = 0.15,
+        temporal_val_ratio: float = 0.12,
+        spatial_val_every_n: int = 10,
         overlap_buffer: int = 6,
         climate_dropout_prob: float = 0.25,
     ):
@@ -65,20 +69,32 @@ class GreenEarthNetDataset(Dataset):
         self.ftps: list[np.ndarray] = []
         self.climates: list[str] = []
 
-        for npz_path in npz_files:
+        for area_idx, npz_path in enumerate(npz_files):
+            is_spatial_val_area = (
+                split in ("train", "train_val")
+                and spatial_val_every_n > 0
+                and (area_idx % spatial_val_every_n == 5)
+            )
+
             with np.load(npz_path, allow_pickle=True) as z:
                 n_total = len(z["target"])
 
-                # Divisione temporale per area tra train (85%) e train_val (15%)
-                # con buffer di sicurezza per evitare finestre sovrapposte al confine
                 if split == "train":
-                    cut = int(n_total * (1.0 - val_ratio))
+                    if is_spatial_val_area:
+                        # Intera area riservata alla validazione spaziale
+                        continue
+                    cut = int(n_total * (1.0 - temporal_val_ratio))
                     indices = range(0, max(1, cut))
                 elif split == "train_val":
-                    cut = int(n_total * (1.0 - val_ratio)) + overlap_buffer
-                    if cut >= n_total:
-                        continue
-                    indices = range(cut, n_total)
+                    if is_spatial_val_area:
+                        # Intera area inclusa in train_val (validazione spaziale)
+                        indices = range(0, n_total)
+                    else:
+                        # Ultimo 12% temporale dell'area con buffer anti-sovrapposizione
+                        cut = int(n_total * (1.0 - temporal_val_ratio)) + overlap_buffer
+                        if cut >= n_total:
+                            continue
+                        indices = range(cut, n_total)
                 else:
                     indices = range(0, n_total)
 
@@ -108,8 +124,8 @@ class GreenEarthNetDataset(Dataset):
             scaler=self.scaler,
         )
 
-        # Climate dropout in training: abitua la rete a gestire climate="unknown" (indice 0) come in ood-s
-        if self.climate_dropout_prob > 0.0 and np.random.rand() < self.climate_dropout_prob:
+        # Climate dropout con torch.rand (sicuro in multi-processing con num_workers > 0)
+        if self.climate_dropout_prob > 0.0 and torch.rand(1).item() < self.climate_dropout_prob:
             item["climate_idx"] = np.int64(0)
 
         return item
@@ -132,7 +148,6 @@ def collate_greenearthnet(batch: list[dict[str, np.ndarray]]) -> dict[str, torch
     history_padded = torch.zeros((batch_size, max_h, h_dim), dtype=torch.float32)
     future_padded = torch.zeros((batch_size, max_f, f_dim), dtype=torch.float32)
 
-    # Maschere di padding: True dove il passo temporale è valido, False dove è padding
     history_valid_mask = torch.zeros((batch_size, max_h), dtype=torch.bool)
     future_valid_mask = torch.zeros((batch_size, max_f), dtype=torch.bool)
 
