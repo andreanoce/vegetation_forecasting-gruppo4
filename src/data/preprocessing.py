@@ -21,12 +21,10 @@ def _forward_and_backward_fill_2d(arr: np.ndarray) -> np.ndarray:
     lungo l'asse temporale (axis=0) su un array (T, C).
     """
     out = arr.copy()
-    # Forward-fill
     for t in range(1, out.shape[0]):
         nan_mask = np.isnan(out[t])
         if np.any(nan_mask):
             out[t, nan_mask] = out[t - 1, nan_mask]
-    # Backward-fill difensivo nel caso i primi giorni fossero NaN
     for t in range(out.shape[0] - 2, -1, -1):
         nan_mask = np.isnan(out[t])
         if np.any(nan_mask):
@@ -59,7 +57,10 @@ def preprocess_window(
     """
     history = np.asarray(history, dtype=np.float32)
     future = np.asarray(future, dtype=np.float32)
-    target_raw = np.nan_to_num(np.asarray(target, dtype=np.float32), nan=0.0)
+    target_raw = np.asarray(target, dtype=np.float32)
+    if np.isnan(target_raw).any():
+        raise ValueError("Rilevati valori NaN inattesi nella matrice target.")
+
     ftp = np.asarray(future_target_positions, dtype=np.int64)
 
     t_hist = history.shape[0]
@@ -70,7 +71,6 @@ def preprocess_window(
     is_clear_sky = is_clear_sky_bool.astype(np.float32)
     clear_sky_indices = np.flatnonzero(is_clear_sky_bool)
 
-    # Guardia difensiva se in un test set futuro una finestra non avesse esattamente 3 indici
     if len(clear_sky_indices) == 0:
         clear_sky_indices = np.array([0, t_hist // 2, t_hist - 1], dtype=np.int64)
     elif len(clear_sky_indices) < 3:
@@ -85,11 +85,11 @@ def preprocess_window(
     )
 
     # 2. Normalizzazione con lo scaler del train
-    hist_norm = scaler.transform_features(history)                          # (T_hist, 21)
-    fut_cov_norm = scaler.transform_features(future[:, COV_COLS], COV_COLS) # (T_fut, 18)
-    target_norm = scaler.transform_target(target_raw)                       # (3, 3)
+    hist_norm = scaler.transform_features(history)                           # (T_hist, 21)
+    fut_cov_norm = scaler.transform_features(future[:, COV_COLS], COV_COLS)  # (T_fut, 18)
+    target_norm = scaler.transform_target(target_raw)                        # (3, 3)
     # Normalizzato con transform_target (target_mean/target_var) per coerenza esatta con target_norm
-    last_clear_target_norm = scaler.transform_target(last_clear_target_raw) # (3,)
+    last_clear_target_norm = scaler.transform_target(last_clear_target_raw)  # (3,)
 
     # 3. Gestione NaN nelle 18 covariate (meteo + nubi + Fourier)
     hist_weather_missing = np.isnan(hist_norm[:, WEATHER_COLS]).mean(axis=1, keepdims=True).astype(np.float32)
@@ -127,7 +127,6 @@ def preprocess_window(
     ftp_clipped = np.clip(ftp, 0, t_fut - 1)
     is_target_day = np.zeros((t_fut, 1), dtype=np.float32)
     is_target_day[ftp_clipped, 0] = 1.0
-    # Distanza temporale reale dall'ultima osservazione clear-sky storica
     trailing_hist_days = float((t_hist - 1) - clear_sky_indices[-1])
     days_from_now = ((np.arange(1, t_fut + 1, dtype=np.float32) + trailing_hist_days)[:, None]) / 15.0
 
@@ -152,7 +151,6 @@ def preprocess_window(
     hist_clear_steps = np.concatenate([hist_step_feats, hist_deltas], axis=1).astype(np.float32)
 
     # 7. Rappresentazione compatta sui 3 intervalli futuri: shape (3, 27)
-    # La media meteo sull'intervallo viene calcolata PRIMA dell'imputazione a 0.0 (ignorando i NaN)
     future_step_list = []
     prev_idx = 0
     for step_i, pos in enumerate(ftp_clipped):
@@ -168,8 +166,8 @@ def preprocess_window(
     future_step_features = np.stack(future_step_list, axis=0).astype(np.float32)
 
     # 8. Codifica della classe climatica di Köppen (con fallback su 'unknown' = 0)
-    climate_Idx_val = CLIMATE_TO_IDX.get(str(climate), 0)
-    climate_idx = np.int64(climate_Idx_val)
+    climate_idx_val = CLIMATE_TO_IDX.get(str(climate), 0)
+    climate_idx = np.int64(climate_idx_val)
 
     return {
         "history_seq": history_seq,                       # (T_hist, 24)

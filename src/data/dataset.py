@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal, Union
+from typing import Any, Literal, Union
 
 import numpy as np
 import torch
@@ -16,17 +16,40 @@ from src.config import (
 from src.data.preprocessing import preprocess_window
 from src.data.scaler import ArcsinhScaler
 
-SplitName = Literal["train", "train_val", "val_id", "ood_s", "ood_t", "custom"]
+SplitName = Literal[
+    "train",
+    "train_val",
+    "train_val_s",
+    "train_val_t",
+    "val_id",
+    "ood_s",
+    "ood_t",
+    "custom",
+]
+
+# 8 aree stratificate per clima riservate alla validazione spaziale (coprono BSk, Csa, Csb, Cfa, Cfb, Dfb, Dfc, unknown
+# senza svuotare nessuna classe rara come Dfa dal training set)
+SPATIAL_VAL_AREAS = {
+    "29TPH.npz",  # Csb
+    "30TYR.npz",  # Cfb
+    "31TDH.npz",  # Csa
+    "32TNR.npz",  # Cfa
+    "32VMM.npz",  # Dfc
+    "32VPP.npz",  # unknown
+    "34TDQ.npz",  # Dfb
+    "34TEL.npz",  # BSk
+}
 
 
 class GreenEarthNetDataset(Dataset):
     """
     Dataset PyTorch per GreenEarthNet (previsione multi-output di NDVI, GNDVI, EVI).
-    Per 'train' e 'train_val' effettua uno split ibrido Spazio-Temporale senza data leakage:
-      - Validazione Spaziale: 1 area ogni 10 (8 aree su 84) è interamente riservata a 'train_val'
-        per misurare la generalizzazione su regioni mai viste (come in ood-s).
-      - Validazione Temporale: sulle restanti 76 aree, l'ultimo 12% delle finestre (fine 2019/2020)
-        dopo un buffer di 6 finestre (zero minicubi condivisi) è riservato a 'train_val'.
+    Sullo split di train applica una divisione Spazio-Temporale basata sulle date reali:
+      - Validazione Spaziale ('train_val_s'): 8 aree stratificate per clima mai viste in 'train'.
+      - Validazione Temporale ('train_val_t'): sulle restanti 76 aree, tutte le finestre con
+        primo target futuro >= '2019-08-15', mentre 'train' usa solo finestre con ultimo target
+        futuro < '2019-07-15' (buffer di 31 giorni di calendario -> zero sovrapposizioni).
+      - 'train_val': unione di 'train_val_s' e 'train_val_t' (con flag booleano 'is_spatial_val').
     """
 
     def __init__(
@@ -34,9 +57,9 @@ class GreenEarthNetDataset(Dataset):
         split: SplitName = "train",
         data_dir: Union[str, Path, None] = None,
         scaler: ArcsinhScaler | None = None,
-        temporal_val_ratio: float = 0.12,
-        spatial_val_every_n: int = 10,
-        overlap_buffer: int = 6,
+        train_cutoff_date: str = "2019-07-15",
+        val_start_date: str = "2019-08-15",
+        spatial_val_areas: set[str] | None = None,
         climate_dropout_prob: float = 0.25,
     ):
         super().__init__()
@@ -44,11 +67,11 @@ class GreenEarthNetDataset(Dataset):
         self.scaler = scaler if scaler is not None else ArcsinhScaler(TRAIN_SCALER_PATH)
         self.is_training = split == "train"
         self.climate_dropout_prob = climate_dropout_prob if self.is_training else 0.0
+        held_out_areas = SPATIAL_VAL_AREAS if spatial_val_areas is None else spatial_val_areas
 
-        # Selezione della cartella dati corretta
         if data_dir is not None:
             folder = Path(data_dir)
-        elif split in ("train", "train_val"):
+        elif split in ("train", "train_val", "train_val_s", "train_val_t"):
             folder = TRAIN_DIR
         elif split == "val_id":
             folder = VAL_ID_DIR
@@ -68,35 +91,40 @@ class GreenEarthNetDataset(Dataset):
         self.targets: list[np.ndarray] = []
         self.ftps: list[np.ndarray] = []
         self.climates: list[str] = []
+        self.is_spatial_val: list[bool] = []
 
-        for area_idx, npz_path in enumerate(npz_files):
-            is_spatial_val_area = (
-                split in ("train", "train_val")
-                and spatial_val_every_n > 0
-                and (area_idx % spatial_val_every_n == 5)
-            )
+        for npz_path in npz_files:
+            is_spatial_area = npz_path.name in held_out_areas
+
+            if split == "train" and is_spatial_area:
+                continue
+            if split == "train_val_s" and not is_spatial_area:
+                continue
+            if split == "train_val_t" and is_spatial_area:
+                continue
 
             with np.load(npz_path, allow_pickle=True) as z:
                 n_total = len(z["target"])
 
                 if split == "train":
-                    if is_spatial_val_area:
-                        # Intera area riservata alla validazione spaziale
-                        continue
-                    cut = int(n_total * (1.0 - temporal_val_ratio))
-                    indices = range(0, max(1, cut))
-                elif split == "train_val":
-                    if is_spatial_val_area:
-                        # Intera area inclusa in train_val (validazione spaziale)
-                        indices = range(0, n_total)
-                    else:
-                        # Ultimo 12% temporale dell'area con buffer anti-sovrapposizione
-                        cut = int(n_total * (1.0 - temporal_val_ratio)) + overlap_buffer
-                        if cut >= n_total:
-                            continue
-                        indices = range(cut, n_total)
+                    tts = z["target_timestamps"]
+                    indices = [
+                        i for i in range(n_total)
+                        if str(tts[i][-1])[:10] < train_cutoff_date
+                    ]
+                elif split == "train_val_s" or (split == "train_val" and is_spatial_area):
+                    indices = list(range(n_total))
+                elif split in ("train_val", "train_val_t") and not is_spatial_area:
+                    tts = z["target_timestamps"]
+                    indices = [
+                        i for i in range(n_total)
+                        if str(tts[i][0])[:10] >= val_start_date
+                    ]
                 else:
-                    indices = range(0, n_total)
+                    indices = list(range(n_total))
+
+                if not indices:
+                    continue
 
                 hist_arr = z["history"]
                 fut_arr = z["future"]
@@ -110,11 +138,12 @@ class GreenEarthNetDataset(Dataset):
                     self.targets.append(targ_arr[i])
                     self.ftps.append(ftp_arr[i])
                     self.climates.append(str(clim_arr[i]))
+                    self.is_spatial_val.append(bool(is_spatial_area))
 
     def __len__(self) -> int:
         return len(self.targets)
 
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         item = preprocess_window(
             history=self.histories[idx],
             future=self.futures[idx],
@@ -124,14 +153,14 @@ class GreenEarthNetDataset(Dataset):
             scaler=self.scaler,
         )
 
-        # Climate dropout con torch.rand (sicuro in multi-processing con num_workers > 0)
         if self.climate_dropout_prob > 0.0 and torch.rand(1).item() < self.climate_dropout_prob:
             item["climate_idx"] = np.int64(0)
 
+        item["is_spatial_val"] = self.is_spatial_val[idx]
         return item
 
 
-def collate_greenearthnet(batch: list[dict[str, np.ndarray]]) -> dict[str, torch.Tensor]:
+def collate_greenearthnet(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     """
     Unisce una lista di campioni di lunghezza variabile in un batch PyTorch,
     applicando zero-padding a history_seq e future_seq e creando le maschere booleane.
@@ -172,6 +201,7 @@ def collate_greenearthnet(batch: list[dict[str, np.ndarray]]) -> dict[str, torch
         "last_clear_target_norm": torch.from_numpy(np.stack([s["last_clear_target_norm"] for s in batch])),    # (B, 3)
         "last_clear_target_raw": torch.from_numpy(np.stack([s["last_clear_target_raw"] for s in batch])),      # (B, 3)
         "climate_idx": torch.tensor([s["climate_idx"] for s in batch], dtype=torch.long),          # (B,)
+        "is_spatial_val": torch.tensor([s["is_spatial_val"] for s in batch], dtype=torch.bool),    # (B,)
         "target_norm": torch.from_numpy(np.stack([s["target_norm"] for s in batch])),              # (B, 3, 3)
         "target_raw": torch.from_numpy(np.stack([s["target_raw"] for s in batch])),                # (B, 3, 3)
     }
@@ -183,9 +213,15 @@ def create_dataloader(
     num_workers: int = 0,
     data_dir: Union[str, Path, None] = None,
     scaler: ArcsinhScaler | None = None,
+    **dataset_kwargs: Any,
 ) -> DataLoader:
     """Crea il DataLoader pronto per il training o la valutazione."""
-    dataset = GreenEarthNetDataset(split=split, data_dir=data_dir, scaler=scaler)
+    dataset = GreenEarthNetDataset(
+        split=split,
+        data_dir=data_dir,
+        scaler=scaler,
+        **dataset_kwargs,
+    )
     shuffle = split == "train"
     generator = torch.Generator().manual_seed(SEED) if shuffle else None
 

@@ -86,10 +86,18 @@ class ArcsinhScaler:
         Convenzione shape del progetto:
           - Target senza quantili: (3_step, 3_indici) o (Batch, 3_step, 3_indici) -> target_axis = -1
           - Predizioni coi 3 quantili: (Batch, 3_step, 3_indici, 3_quantili)      -> target_axis = -2
-        Se target_axis è None, usa automaticamente -2 per tensori 4D e -1 altrimenti.
+        Per un singolo campione 3D coi quantili (3_step, 3_indici, 3_quantili), passare target_axis=-2.
         """
+        if not isinstance(y, torch.Tensor):
+            y = np.asarray(y, dtype=np.float32)
+
         if target_axis is None:
             target_axis = -2 if y.ndim == 4 else -1
+
+        if y.shape[target_axis] != 3:
+            raise ValueError(
+                f"Attesa dimensione 3 su target_axis={target_axis}, trovata shape {tuple(y.shape)}"
+            )
 
         shape = [1] * y.ndim
         shape[target_axis] = 3
@@ -99,20 +107,6 @@ class ArcsinhScaler:
             std = torch.as_tensor(self.target_std, dtype=y.dtype, device=y.device).view(*shape)
             return torch.sinh(y) * std + mean
 
-        y = np.asarray(y, dtype=np.float32)
         mean = self.target_mean.reshape(*shape)
         std = self.target_std.reshape(*shape)
         return np.sinh(y) * std + mean
-
-
-if __name__ == "__main__":
-    # Test rapido di verifica
-    scaler = ArcsinhScaler()
-    dummy_target = np.array([[0.48, 0.56, 0.28], [0.50, 0.57, 0.29]], dtype=np.float32)
-    norm_t = scaler.transform_target(dummy_target)
-    rec_t = scaler.inverse_transform_target(norm_t)
-    max_err = np.max(np.abs(dummy_target - rec_t))
-    print("Scaler caricato con successo!")
-    print("Target originale:\n", dummy_target)
-    print("Target normalizzato (arcsinh):\n", norm_t)
-    print(f"Errore massimo di ricostruzione inversa: {max_err:.2e}")
