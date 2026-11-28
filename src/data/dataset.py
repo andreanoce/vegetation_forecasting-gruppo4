@@ -44,12 +44,12 @@ SPATIAL_VAL_AREAS = {
 class GreenEarthNetDataset(Dataset):
     """
     Dataset PyTorch per GreenEarthNet (previsione multi-output di NDVI, GNDVI, EVI).
-    Sullo split di train applica una divisione Spazio-Temporale basata sulle date reali:
-      - Validazione Spaziale ('train_val_s'): 8 aree stratificate per clima mai viste in 'train'
-        (coprono tutte le stagioni 2017-2019, inclusa la crescita primaverile).
-      - Validazione Temporale ('train_val_t'): sulle restanti 76 aree, tutte le finestre con
-        primo target futuro >= '2019-08-15', mentre 'train' usa solo finestre con ultimo target
-        futuro < '2019-07-15' (buffer di 31 giorni di calendario -> zero sovrapposizioni).
+    Sullo split di train applica una divisione Spazio-Temporale rigorosa:
+      - Validazione Spaziale ('train_val_s'): 8 aree stratificate per clima mai viste in 'train'.
+      - Validazione Temporale ('train_val_t'): sulle restanti 76 aree, 'train' usa solo finestre
+        il cui ULTIMO giorno futuro cade prima di 'train_cutoff_date' (2019-07-01), mentre
+        'train_val_t' usa solo finestre il cui PRIMO giorno di storia ('history_timestamps[0]')
+        cade da 'val_start_date' (2019-07-08) in poi -> zero giorni in comune tra train e val.
       - 'train_val': unione di 'train_val_s' e 'train_val_t' (con flag booleano 'is_spatial_val').
     """
 
@@ -58,16 +58,19 @@ class GreenEarthNetDataset(Dataset):
         split: SplitName = "train",
         data_dir: Union[str, Path, None] = None,
         scaler: ArcsinhScaler | None = None,
-        train_cutoff_date: str = "2019-07-15",
-        val_start_date: str = "2019-08-15",
+        train_cutoff_date: str = "2019-07-01",
+        val_start_date: str = "2019-07-08",
         spatial_val_areas: set[str] | None = None,
         climate_dropout_prob: float = 0.25,
+        cache_in_ram: bool = True,
     ):
         super().__init__()
         self.split = split
         self.scaler = scaler if scaler is not None else ArcsinhScaler(TRAIN_SCALER_PATH)
         self.is_training = split == "train"
         self.climate_dropout_prob = climate_dropout_prob if self.is_training else 0.0
+        self.cache_in_ram = cache_in_ram
+        self._cache: dict[int, dict[str, Any]] = {}
         held_out_areas = SPATIAL_VAL_AREAS if spatial_val_areas is None else spatial_val_areas
 
         if data_dir is not None:
@@ -90,6 +93,7 @@ class GreenEarthNetDataset(Dataset):
         self.histories: list[np.ndarray] = []
         self.futures: list[np.ndarray] = []
         self.targets: list[np.ndarray] = []
+        self.target_masks: list[np.ndarray] = []
         self.ftps: list[np.ndarray] = []
         self.climates: list[str] = []
         self.is_spatial_val: list[bool] = []
@@ -110,6 +114,7 @@ class GreenEarthNetDataset(Dataset):
                 n_total = len(z["target"])
 
                 if split == "train":
+                    # Tutte le finestre che FINISCONO (ultimo target futuro) prima di train_cutoff_date
                     tts = z["target_timestamps"]
                     indices = [
                         i for i in range(n_total)
@@ -118,10 +123,11 @@ class GreenEarthNetDataset(Dataset):
                 elif split == "train_val_s" or (split == "train_val" and is_spatial_area):
                     indices = list(range(n_total))
                 elif split in ("train_val", "train_val_t") and not is_spatial_area:
-                    tts = z["target_timestamps"]
+                    # Tutte le finestre la cui STORIA INIZIA da val_start_date in poi (zero giorni condivisi)
+                    hts = z["history_timestamps"]
                     indices = [
                         i for i in range(n_total)
-                        if str(tts[i][0])[:10] >= val_start_date
+                        if str(hts[i][0])[:10] >= val_start_date
                     ]
                 else:
                     indices = list(range(n_total))
@@ -132,6 +138,7 @@ class GreenEarthNetDataset(Dataset):
                 hist_arr = z["history"]
                 fut_arr = z["future"]
                 targ_arr = z["target"]
+                tmask_arr = z["target_mask"] if "target_mask" in z.files else np.zeros_like(targ_arr, dtype=bool)
                 ftp_arr = z["future_target_positions"]
                 clim_arr = z["climate"]
 
@@ -139,6 +146,7 @@ class GreenEarthNetDataset(Dataset):
                     self.histories.append(hist_arr[i])
                     self.futures.append(fut_arr[i])
                     self.targets.append(targ_arr[i])
+                    self.target_masks.append(tmask_arr[i])
                     self.ftps.append(ftp_arr[i])
                     self.climates.append(str(clim_arr[i]))
                     self.is_spatial_val.append(bool(is_spatial_area))
@@ -147,20 +155,28 @@ class GreenEarthNetDataset(Dataset):
         return len(self.targets)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        item = preprocess_window(
-            history=self.histories[idx],
-            future=self.futures[idx],
-            target=self.targets[idx],
-            future_target_positions=self.ftps[idx],
-            climate=self.climates[idx],
-            scaler=self.scaler,
-        )
+        if self.cache_in_ram and idx in self._cache:
+            base_item = self._cache[idx]
+        else:
+            base_item = preprocess_window(
+                history=self.histories[idx],
+                future=self.futures[idx],
+                target=self.targets[idx],
+                future_target_positions=self.ftps[idx],
+                climate=self.climates[idx],
+                scaler=self.scaler,
+                target_mask=self.target_masks[idx],
+            )
+            base_item["is_spatial_val"] = self.is_spatial_val[idx]
+            if self.cache_in_ram:
+                self._cache[idx] = base_item
 
         if self.climate_dropout_prob > 0.0 and torch.rand(1).item() < self.climate_dropout_prob:
+            item = dict(base_item)
             item["climate_idx"] = np.int64(0)
+            return item
 
-        item["is_spatial_val"] = self.is_spatial_val[idx]
-        return item
+        return base_item
 
 
 def collate_greenearthnet(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -207,6 +223,7 @@ def collate_greenearthnet(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor
         "is_spatial_val": torch.tensor([s["is_spatial_val"] for s in batch], dtype=torch.bool),    # (B,)
         "target_norm": torch.from_numpy(np.stack([s["target_norm"] for s in batch])),              # (B, 3, 3)
         "target_raw": torch.from_numpy(np.stack([s["target_raw"] for s in batch])),                # (B, 3, 3)
+        "target_valid": torch.from_numpy(np.stack([s["target_valid"] for s in batch])),            # (B, 3, 3)
     }
 
 
