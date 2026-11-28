@@ -11,6 +11,8 @@ Modello ibrido CNN + GRU-D encoder / GRU decoder con uscita a quantili.
 
 Uscita: (B, 3 passi, 3 indici, 3 quantili) in scala NORMALIZZATA dei target,
 con i quantili nell'ordine QUANTILES = (0.1, 0.5, 0.9).
+
+Ingresso: i batch di preprocess.collate_batch (21 feature originali + maschere).
 """
 
 from __future__ import annotations
@@ -19,18 +21,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from preprocessing import VI_HISTORY_COLS, Preprocessor
+from preprocess import VEGETATION_INDEX_COLUMNS, ArcsinhScaler
 
 QUANTILES = (0.1, 0.5, 0.9)
 N_VI = 3
 
 
-def meteo_columns(pre: Preprocessor) -> list[int]:
-    """Le 18 feature originali di meteo + giorno dell'anno (tutte tranne gli indici).
-    Le feature ingegnerizzate non entrano: il GRU-D calcola da solo ffill e giorni
-    dall'ultima osservazione."""
-    original = [pre.feature_names[i] for i in range(len(pre.keep_idx))]
-    return [pre.feature_names.index(n) for n in original if n not in VI_HISTORY_COLS]
+def meteo_columns(feature_names: list[str]) -> list[int]:
+    """Le 18 covariate (meteo, nubi, giorno dell'anno): tutte le colonne tranne i 3 indici."""
+    return [i for i, name in enumerate(feature_names) if name not in VEGETATION_INDEX_COLUMNS]
 
 
 # --------------------------------------------------------------------------- #
@@ -102,11 +101,11 @@ class GRUDEncoder(nn.Module):
 # Modello completo
 # --------------------------------------------------------------------------- #
 class CNNGRUD(nn.Module):
-    def __init__(self, pre: Preprocessor, channels=64, kernel=5, hidden=128,
-                 dropout=0.1, n_steps=3):
+    def __init__(self, feature_names: list[str], scaler: ArcsinhScaler, channels=64,
+                 kernel=5, hidden=128, dropout=0.1, n_steps=3):
         super().__init__()
-        self.meteo_idx = meteo_columns(pre)
-        self.vi_idx = [pre.feature_names.index(c) for c in VI_HISTORY_COLS]
+        self.meteo_idx = meteo_columns(feature_names)
+        self.vi_idx = [feature_names.index(c) for c in VEGETATION_INDEX_COLUMNS]
 
         self.cnn = MeteoCNN(len(self.meteo_idx), channels, kernel, dropout)
         self.encoder = GRUDEncoder(channels, N_VI, hidden)
@@ -118,10 +117,9 @@ class CNNGRUD(nn.Module):
         # gli indici nella history sono normalizzati con lo scaler delle FEATURE, i target
         # con quello dei TARGET: servono entrambi per esprimere l'ultimo valore osservato
         # nella scala dei target (la mediana e' una variazione rispetto a esso).
-        fs = pre.feat_scaler.subset(self.vi_idx)
-        ts = pre.target_scaler
-        for name, v in [("f_mean", fs.mean), ("f_std", fs.std),
-                        ("t_mean", ts.mean), ("t_std", ts.std)]:
+        for name, v in [("f_mean", scaler.feature_mean[self.vi_idx]),
+                        ("f_std", scaler.feature_std[self.vi_idx]),
+                        ("t_mean", scaler.target_mean), ("t_std", scaler.target_std)]:
             self.register_buffer(name, torch.tensor(v, dtype=torch.float32))
 
     def set_vi_mean(self, x_mean: torch.Tensor):
@@ -135,13 +133,13 @@ class CNNGRUD(nn.Module):
         h_met = b["history"][..., self.meteo_idx]
         f_met = b["future"][..., self.meteo_idx]
         vi = b["history"][..., self.vi_idx]
-        vi_m = b["history_valid"][..., self.vi_idx]
+        vi_m = b["history_observed"][..., self.vi_idx]   # 1 = indice osservato quel giorno
 
         h_emb, f_emb = self.cnn(h_met), self.cnn(f_met)             # 1. CNN condivisa
-        h_enc, x_last = self.encoder(h_emb, vi, vi_m, b["history_pad"])  # 2. GRU-D
+        h_enc, x_last = self.encoder(h_emb, vi, vi_m, b["history_padding"])  # 2. GRU-D
         dec, _ = self.decoder(f_emb, h_enc.unsqueeze(0).contiguous())    # 3. decoder
 
-        idx = b["target_pos"].unsqueeze(-1).expand(-1, -1, dec.size(-1))
+        idx = b["target_positions"].unsqueeze(-1).expand(-1, -1, dec.size(-1))
         z = self.drop(torch.gather(dec, 1, idx))                     # 4. (B, 3, H)
         last = self._feat_to_target_scale(x_last)                    # (B, 3) scala target
         z = torch.cat([z, last.unsqueeze(1).expand(-1, z.size(1), -1)], dim=-1)
