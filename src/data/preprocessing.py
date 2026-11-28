@@ -15,21 +15,18 @@ HIST_STEP_DIM = 22         # 21 feature nei 3 giorni sereni + delta_t
 FUTURE_STEP_DIM = 27       # 18 covariate nel giorno target + 8 medie meteo nell'intervallo + delta_t
 
 
-def _forward_and_backward_fill_2d(arr: np.ndarray) -> np.ndarray:
+def _forward_fill_2d(arr: np.ndarray) -> np.ndarray:
     """
-    Applica il forward-fill (e backward-fill difensivo se la riga 0 fosse NaN)
-    lungo l'asse temporale (axis=0) su un array (T, C).
+    Forward-fill vettorizzato lungo l'asse temporale (axis=0) su un array (T, C):
+    ogni NaN prende l'ultimo valore osservato prima di lui nella stessa colonna.
+    Eventuali NaN prima della prima osservazione vengono posti a 0.0 (media del train).
     """
-    out = arr.copy()
-    for t in range(1, out.shape[0]):
-        nan_mask = np.isnan(out[t])
-        if np.any(nan_mask):
-            out[t, nan_mask] = out[t - 1, nan_mask]
-    for t in range(out.shape[0] - 2, -1, -1):
-        nan_mask = np.isnan(out[t])
-        if np.any(nan_mask):
-            out[t, nan_mask] = out[t + 1, nan_mask]
-    return np.nan_to_num(out, nan=0.0)
+    n_days = arr.shape[0]
+    observed = ~np.isnan(arr)
+    last_obs_idx = np.where(observed, np.arange(n_days)[:, None], 0)
+    last_obs_idx = np.maximum.accumulate(last_obs_idx, axis=0)
+    filled = arr[last_obs_idx, np.arange(arr.shape[1])]
+    return np.nan_to_num(filled, nan=0.0).astype(np.float32)
 
 
 def _safe_nanmean_axis0(arr: np.ndarray) -> np.ndarray:
@@ -51,15 +48,21 @@ def preprocess_window(
     future_target_positions: np.ndarray,
     climate: str,
     scaler: ArcsinhScaler,
+    target_mask: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Trasforma una singola finestra grezza .npz in tensori numerici puliti (zero NaN).
     """
     history = np.asarray(history, dtype=np.float32)
     future = np.asarray(future, dtype=np.float32)
-    target_raw = np.asarray(target, dtype=np.float32)
-    if np.isnan(target_raw).any():
-        raise ValueError("Rilevati valori NaN inattesi nella matrice target.")
+    target_arr = np.asarray(target, dtype=np.float32)
+
+    # Maschera di validità dei target (utile se l'Hidden Test Set avesse target mascherati)
+    if target_mask is not None:
+        target_valid = (~np.asarray(target_mask, dtype=bool)) & (~np.isnan(target_arr))
+    else:
+        target_valid = ~np.isnan(target_arr)
+    target_raw = np.nan_to_num(target_arr, nan=0.0).astype(np.float32)
 
     ftp = np.asarray(future_target_positions, dtype=np.int64)
 
@@ -87,7 +90,7 @@ def preprocess_window(
     # 2. Normalizzazione con lo scaler del train
     hist_norm = scaler.transform_features(history)                           # (T_hist, 21)
     fut_cov_norm = scaler.transform_features(future[:, COV_COLS], COV_COLS)  # (T_fut, 18)
-    target_norm = scaler.transform_target(target_raw)                        # (3, 3)
+    target_norm = np.nan_to_num(scaler.transform_target(target_raw), nan=0.0)  # (3, 3)
     # Normalizzato con transform_target (target_mean/target_var) per coerenza esatta con target_norm
     last_clear_target_norm = scaler.transform_target(last_clear_target_raw)  # (3,)
 
@@ -98,8 +101,8 @@ def preprocess_window(
     hist_cov_clean = np.nan_to_num(hist_norm[:, COV_COLS], nan=0.0)
     fut_cov_clean = np.nan_to_num(fut_cov_norm, nan=0.0)
 
-    # 4. Forward-fill dei 3 indici di vegetazione storici nei giorni nuvolosi
-    hist_targets_ffill = _forward_and_backward_fill_2d(hist_norm[:, HIST_TARGET_COLS])
+    # 4. Forward-fill vettorizzato dei 3 indici di vegetazione storici nei giorni nuvolosi
+    hist_targets_ffill = _forward_fill_2d(hist_norm[:, HIST_TARGET_COLS])
 
     # Giorni trascorsi dall'ultima osservazione satellitare serena (normalizzati / 10)
     days_since_clear = np.zeros((t_hist, 1), dtype=np.float32)
@@ -170,14 +173,15 @@ def preprocess_window(
     climate_idx = np.int64(climate_idx_val)
 
     return {
-        "history_seq": history_seq,                       # (T_hist, 24)
-        "future_seq": future_seq,                         # (T_fut, 21)
-        "hist_clear_steps": hist_clear_steps,             # (3, 22)
-        "future_step_features": future_step_features,     # (3, 27)
-        "future_target_positions": ftp_clipped,           # (3,)
-        "last_clear_target_norm": last_clear_target_norm, # (3,)
-        "last_clear_target_raw": last_clear_target_raw,   # (3,)
-        "climate_idx": climate_idx,                       # scalare int64
-        "target_norm": target_norm,                       # (3, 3)
-        "target_raw": target_raw,                         # (3, 3)
+        "history_seq": history_seq,                         # (T_hist, 24)
+        "future_seq": future_seq,                           # (T_fut, 21)
+        "hist_clear_steps": hist_clear_steps,               # (3, 22)
+        "future_step_features": future_step_features,       # (3, 27)
+        "future_target_positions": ftp_clipped,             # (3,)
+        "last_clear_target_norm": last_clear_target_norm,   # (3,)
+        "last_clear_target_raw": last_clear_target_raw,     # (3,)
+        "climate_idx": climate_idx,                         # scalare int64
+        "target_norm": target_norm,                         # (3, 3)
+        "target_raw": target_raw,                           # (3, 3)
+        "target_valid": target_valid.astype(np.float32),    # (3, 3) 1.0 = valido, 0.0 = mancante
     }
