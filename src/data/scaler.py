@@ -9,6 +9,9 @@ from src.config import TRAIN_SCALER_PATH
 
 ArrayOrTensor = Union[np.ndarray, torch.Tensor]
 
+# Limite difensivo nello spazio arcsinh per evitare overflow di sinh() in float32 (|x| > 88.7)
+MAX_ARCSINH_MAGNITUDE = 15.0
+
 
 class ArcsinhScaler:
     """
@@ -56,7 +59,7 @@ class ArcsinhScaler:
 
     def inverse_transform_features(self, y: np.ndarray, cols: list[int] | None = None) -> np.ndarray:
         """Inverte la normalizzazione sulle feature."""
-        y = np.asarray(y, dtype=np.float32)
+        y = np.clip(np.asarray(y, dtype=np.float32), -MAX_ARCSINH_MAGNITUDE, MAX_ARCSINH_MAGNITUDE)
         mean = self.feature_mean if cols is None else self.feature_mean[cols]
         std = self.feature_std if cols is None else self.feature_std[cols]
 
@@ -103,10 +106,12 @@ class ArcsinhScaler:
         shape[target_axis] = 3
 
         if isinstance(y, torch.Tensor):
+            y_safe = torch.clamp(y, -MAX_ARCSINH_MAGNITUDE, MAX_ARCSINH_MAGNITUDE)
             mean = torch.as_tensor(self.target_mean, dtype=y.dtype, device=y.device).view(*shape)
             std = torch.as_tensor(self.target_std, dtype=y.dtype, device=y.device).view(*shape)
-            return torch.sinh(y) * std + mean
+            return torch.sinh(y_safe) * std + mean
 
+        y_safe = np.clip(y, -MAX_ARCSINH_MAGNITUDE, MAX_ARCSINH_MAGNITUDE)
         mean = self.target_mean.reshape(*shape)
         std = self.target_std.reshape(*shape)
-        return np.sinh(y) * std + mean
+        return np.sinh(y_safe) * std + mean

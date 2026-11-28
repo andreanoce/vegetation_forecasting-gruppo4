@@ -45,7 +45,8 @@ class GreenEarthNetDataset(Dataset):
     """
     Dataset PyTorch per GreenEarthNet (previsione multi-output di NDVI, GNDVI, EVI).
     Sullo split di train applica una divisione Spazio-Temporale basata sulle date reali:
-      - Validazione Spaziale ('train_val_s'): 8 aree stratificate per clima mai viste in 'train'.
+      - Validazione Spaziale ('train_val_s'): 8 aree stratificate per clima mai viste in 'train'
+        (coprono tutte le stagioni 2017-2019, inclusa la crescita primaverile).
       - Validazione Temporale ('train_val_t'): sulle restanti 76 aree, tutte le finestre con
         primo target futuro >= '2019-08-15', mentre 'train' usa solo finestre con ultimo target
         futuro < '2019-07-15' (buffer di 31 giorni di calendario -> zero sovrapposizioni).
@@ -93,8 +94,10 @@ class GreenEarthNetDataset(Dataset):
         self.climates: list[str] = []
         self.is_spatial_val: list[bool] = []
 
+        is_train_family = split in ("train", "train_val", "train_val_s", "train_val_t")
+
         for npz_path in npz_files:
-            is_spatial_area = npz_path.name in held_out_areas
+            is_spatial_area = is_train_family and (npz_path.name in held_out_areas)
 
             if split == "train" and is_spatial_area:
                 continue
