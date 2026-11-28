@@ -10,13 +10,13 @@ def _resolve_data_dir() -> Path:
     Risolve il percorso della cartella dati in modo compatibile con Windows, Linux e Colab:
       1. Variabile d'ambiente GREENEARTHNET_DATA_DIR (se impostata)
       2. PROJECT_ROOT / "DATA"
-      3. Fallback su PROJECT_ROOT / "data" per filesystem case-sensitive (Linux/macOS)
+      3. Fallback su PROJECT_ROOT / "Prep" per filesystem case-sensitive (Linux/macOS)
     """
     env_dir = os.getenv("GREENEARTHNET_DATA_DIR")
     if env_dir:
         return Path(env_dir).expanduser().resolve()
     upper_dir = PROJECT_ROOT / "DATA"
-    lower_dir = PROJECT_ROOT / "data"
+    lower_dir = PROJECT_ROOT / "Prep"
     if not upper_dir.exists() and lower_dir.exists():
         return lower_dir
     return upper_dir

@@ -6,7 +6,7 @@ from src.config import (
     HIST_TARGET_COLS,
     WEATHER_COLS,
 )
-from src.data.scaler import ArcsinhScaler
+from src.Prep.scaler import ArcsinhScaler
 
 # Numero di canali finali prodotti dal preprocessing
 HISTORY_SEQ_DIM = 24       # 21 feature + is_clear_sky + days_since_clear_sky + weather_missing_frac
